@@ -7,6 +7,7 @@ import { api } from '../../api/client.js'
 import { appQueries, themeQueries } from '../../hooks/queries.js'
 import { serviceSurfaceFrameUrl } from '../../lib/serviceSurface.js'
 import { useReachabilityPhase } from '../../hooks/useOnlineStatus.js'
+import useDialogFocus from '../../hooks/useDialogFocus.js'
 import { getOnlineSnapshot, ReachabilityPhase } from '../../lib/connectivityStore.js'
 import {
   AppTokenStartupState, appTokenIdentity, appTokenStartupState,
@@ -45,6 +46,9 @@ import {
 import { useManagedAppFrameForwarding } from '../../hooks/useManagedAppEvents.js'
 import { writeClipboardText } from '../../runtime/clipboard.js'
 import {
+  parseAppFileExport, readAppFileExport, saveAppFileExport,
+} from '../../lib/appFileExport.js'
+import {
   initSwapState, reduceSwap, compareVersions, INCOMING_SWAP_TIMEOUT_MS,
 } from '../../lib/previewSwapState.js'
 import { GlobeOffRealTimeSearch } from '@openai/apps-sdk-ui/components/Icon'
@@ -53,6 +57,49 @@ import './AppCanvas.css'
 function appFrameRequestUrl(appId, version, frameRev) {
   return `${api.apps.frameUrl(appId)}?v=${encodeURIComponent(version)}`
     + (frameRev ? `-${frameRev}` : '')
+}
+
+function fileExportInk(color) {
+  if (!/^#[0-9a-f]{6}$/i.test(color || '')) return undefined
+  const channels = [1, 3, 5].map(offset => parseInt(color.slice(offset, offset + 2), 16) / 255)
+  const linear = channels.map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4)
+  const luminance = linear[0] * .2126 + linear[1] * .7152 + linear[2] * .0722
+  return luminance > .22 ? '#172008' : '#ffffff'
+}
+
+function AppFileExportDialog({ appName, themeColor, request, onCancel, onConfirm }) {
+  const dialogRef = useRef(null)
+  const cancelRef = useRef(null)
+  useDialogFocus({
+    containerRef: dialogRef, initialFocusRef: cancelRef,
+    onClose: onCancel, shouldCloseOnEscape: () => !request.busy,
+  })
+  useEffect(() => {
+    if (request.busy) dialogRef.current?.focus({ preventScroll: true })
+  }, [request.busy])
+  return (
+    <div className="canvas-file-export" role="dialog" aria-modal="true"
+      aria-labelledby="canvas-file-export-title" ref={dialogRef} tabIndex={-1}>
+      <div className="canvas-file-export__card" style={themeColor ? {
+        '--file-export-accent': themeColor,
+        '--file-export-ink': fileExportInk(themeColor),
+      } : undefined}>
+        <div className="canvas-file-export__eyebrow">FILE EXPORT</div>
+        <h2 id="canvas-file-export-title">Save a file from {appName || 'this app'}?</h2>
+        <p className="canvas-file-export__name">{request.name}</p>
+        <p>Only this app’s own file is accessible. Nothing downloads until you confirm.</p>
+        {request.error && <p className="canvas-file-export__error" role="alert">{request.error}</p>}
+        <div className="canvas-file-export__actions">
+          <button type="button" ref={cancelRef} onClick={onCancel}
+            disabled={request.busy}>Cancel</button>
+          <button type="button" className="canvas-file-export__primary"
+            onClick={onConfirm} disabled={request.busy}>
+            {request.busy ? 'Preparing…' : 'Save file'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 // =================================================================
@@ -99,6 +146,9 @@ function appFrameRequestUrl(appId, version, frameRev) {
 //      live visible frame → parent, answered by moebius:clipboard-write-result.
 //      The host is a fallback for engines that deny clipboard access inside an
 //      opaque frame; source attribution and visibility gate the side effect.
+//   File export: {type:'moebius:file-export', requestId, path, name?}
+//      live visible frame → shell confirmation → own storage file download.
+//      The app supplies no app id or token; result is file-export-result.
 //
 //   2. {type: 'moebius:frame-mounted', appId}              frame → parent
 //      Fired by the frame AFTER its first render COMMITS (MountSignal's
@@ -335,7 +385,8 @@ function CameraPreviewLayer({ preview }) {
 // well within the server-side validity window. The token is app-scoped (keyed
 // by appId server-side), so it is identical for both buffered versions.
 const AppCanvas = forwardRef(function AppCanvas({
-  appId, version = 0, storageGeneration = null, appName, appSlug, offlineCapable = false,
+  appId, version = 0, storageGeneration = null, appName, appSlug, themeColor,
+  offlineCapable = false,
   capabilityContract = null,
   subscribeManagedAppEvents = null,
   // The shell's applied presentation for this app: full-bleed immersive,
@@ -374,6 +425,8 @@ const AppCanvas = forwardRef(function AppCanvas({
   const queryClient = useQueryClient()
   const [serviceSurface, setServiceSurface] = useState(null)
   const [cameraPreview, setCameraPreview] = useState(null)
+  const [pendingFileExport, setPendingFileExport] = useState(null)
+  const pendingFileExportRef = useRef(null)
   const canvasWrapRef = useRef(null)
   const serviceRequestRef = useRef(0)
   const serviceFrameRef = useRef(null)
@@ -615,6 +668,49 @@ const AppCanvas = forwardRef(function AppCanvas({
   visibleRef.current = visible
   const frameVisibleRef = useRef(frameVisible)
   frameVisibleRef.current = frameVisible
+  function finishFileExport(request, result) {
+    if (pendingFileExportRef.current !== request) return
+    pendingFileExportRef.current = null
+    setPendingFileExport(null)
+    try {
+      request.source.postMessage({
+        type: 'moebius:file-export-result', requestId: request.requestId,
+        ...result,
+      }, '*')
+    } catch { /* frame retired while confirmation was open */ }
+  }
+  async function confirmFileExport() {
+    const request = pendingFileExportRef.current
+    if (!request || request.busy) return
+    if (!visibleRef.current || request.appId !== appId
+        || attributedFrameVersion(framesRef.current, request.source)
+        !== liveVersionRef.current || request.frameVersion !== liveVersionRef.current) {
+      finishFileExport(request, { cancelled: true })
+      return
+    }
+    const busy = { ...request, busy: true, error: null }
+    pendingFileExportRef.current = busy
+    setPendingFileExport(busy)
+    try {
+      const blob = await readAppFileExport({
+        appId, path: request.path, token: hostTokenRef.current,
+      })
+      if (pendingFileExportRef.current !== busy) return
+      if (!visibleRef.current || request.appId !== appId
+          || attributedFrameVersion(framesRef.current, request.source)
+          !== liveVersionRef.current || request.frameVersion !== liveVersionRef.current) {
+        finishFileExport(busy, { cancelled: true })
+        return
+      }
+      saveAppFileExport(blob, request.name)
+      finishFileExport(busy, { ok: true })
+    } catch (error) {
+      if (pendingFileExportRef.current !== busy) return
+      const failed = { ...request, error: error?.message || 'File export failed.' }
+      pendingFileExportRef.current = failed
+      setPendingFileExport(failed)
+    }
+  }
   const capabilityContractRef = useRef(capabilityContract)
   capabilityContractRef.current = capabilityContract
   const shellShortcutsRef = useRef(Array.isArray(shellShortcuts) ? shellShortcuts : [])
@@ -965,6 +1061,39 @@ const AppCanvas = forwardRef(function AppCanvas({
         return
       }
 
+      if (msg.type === 'moebius:file-export') {
+        if (!visibleRef.current) {
+          if (typeof msg.requestId === 'string' && msg.requestId.length <= 160) {
+            try { e.source.postMessage({
+              type: 'moebius:file-export-result', requestId: msg.requestId,
+              cancelled: true,
+            }, '*') } catch {}
+          }
+          return
+        }
+        const parsed = parseAppFileExport(msg)
+        if (!parsed) {
+          if (typeof msg.requestId === 'string' && msg.requestId.length <= 160) {
+            try { e.source.postMessage({
+              type: 'moebius:file-export-result', requestId: msg.requestId,
+              error: 'Invalid file export request.',
+            }, '*') } catch {}
+          }
+          return
+        }
+        if (pendingFileExportRef.current) {
+          try { e.source.postMessage({
+            type: 'moebius:file-export-result', requestId: parsed.requestId,
+            error: 'Finish the current file export first.',
+          }, '*') } catch {}
+          return
+        }
+        const request = { ...parsed, source: e.source, frameVersion: srcVersion, appId }
+        pendingFileExportRef.current = request
+        setPendingFileExport(request)
+        return
+      }
+
       if (msg.type === 'moebius:account-link-register') {
         if (!visibleRef.current || !identityLinkBrokerAllowed(capabilityContractRef.current)) {
           return
@@ -1201,6 +1330,20 @@ const AppCanvas = forwardRef(function AppCanvas({
   // an AppCanvas unmount or a different app taking over this component.
   useEffect(() => () => {
     clearAccountLinkRegistration()
+  }, [appId])
+
+  // A confirmation belongs to one visible frame. Switching away or promoting
+  // a new version cannot leave a stale prompt able to export the old file.
+  useLayoutEffect(() => {
+    const request = pendingFileExportRef.current
+    if (request && (!visible || request.appId !== appId
+        || request.frameVersion !== swap.liveVersion)) {
+      finishFileExport(request, { cancelled: true })
+    }
+  }, [appId, visible, swap.liveVersion])
+  useEffect(() => () => {
+    const request = pendingFileExportRef.current
+    if (request) finishFileExport(request, { cancelled: true })
   }, [appId])
 
   // Capabilities belong to a visible workspace pane, not merely the focused
@@ -1769,6 +1912,11 @@ const AppCanvas = forwardRef(function AppCanvas({
         )
       })}
       <CameraPreviewLayer preview={cameraPreview} />
+      {pendingFileExport && visible && (
+        <AppFileExportDialog appName={appName} themeColor={themeColor} request={pendingFileExport}
+          onCancel={() => finishFileExport(pendingFileExport, { cancelled: true })}
+          onConfirm={confirmFileExport} />
+      )}
       {/* One-shot "updated" shimmer on a successful swap. Keyed on the SWAP
           COUNT — not the live version and not gated on liveLoaded — so it
           remounts (replays) exactly when a promotion lands, and a live-frame

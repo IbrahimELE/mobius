@@ -4443,6 +4443,52 @@ function makeClipboard() {
 }
 
 //#endregion
+//#region src/runtime/fileExport.js
+function makeFileExport() {
+	const pending = /* @__PURE__ */ new Map();
+	function onMessage(event) {
+		if (event.source !== window.parent || event.origin !== window.location.origin) return;
+		const message = event.data;
+		if (message?.type !== "moebius:file-export-result") return;
+		const settle = pending.get(message.requestId);
+		if (!settle) return;
+		pending.delete(message.requestId);
+		if (message.ok) settle.resolve(true);
+		else if (message.cancelled) settle.resolve(false);
+		else settle.reject(new Error(message.error || "File export failed."));
+	}
+	window.addEventListener("message", onMessage);
+	return {
+		save(path, name) {
+			if (typeof path !== "string" || !path) return Promise.reject(/* @__PURE__ */ new Error("File path is required."));
+			const requestId = globalThis.crypto?.randomUUID?.() || `export-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			return new Promise((resolve, reject) => {
+				pending.set(requestId, {
+					resolve,
+					reject
+				});
+				try {
+					window.parent.postMessage({
+						type: "moebius:file-export",
+						requestId,
+						path,
+						name
+					}, "*");
+				} catch (error) {
+					pending.delete(requestId);
+					reject(error);
+				}
+			});
+		},
+		_destroy() {
+			window.removeEventListener("message", onMessage);
+			for (const settle of pending.values()) settle.resolve(false);
+			pending.clear();
+		}
+	};
+}
+
+//#endregion
 //#region src/runtime/projects.js
 const REQUEST_TIMEOUT_MS = 15e3;
 function cleanText(value, maximum = 256) {
@@ -4564,6 +4610,7 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		_runtimeContext.capabilities?._destroy?.();
 		_runtimeContext.projects?._destroy?.();
 		_runtimeContext.chat?._destroy?.();
+		_runtimeContext.fileExport?._destroy?.();
 	}
 	const tokenRef = { current: getToken };
 	const scopedToken = async (options) => {
@@ -4584,6 +4631,7 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		getToken: scopedToken,
 		storage
 	});
+	const fileExport = makeFileExport();
 	const api = {
 		appId,
 		get online() {
@@ -4616,6 +4664,7 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		split: makeSplit(),
 		immersive: makeImmersive({ appId }),
 		clipboard: makeClipboard(),
+		fileExport,
 		projects
 	};
 	window.mobius = api;
@@ -4627,6 +4676,7 @@ function init({ appId, appInstanceId = null, getToken, capabilityContract = null
 		capabilities,
 		projects,
 		chat,
+		fileExport,
 		api
 	};
 	storage._drain();
