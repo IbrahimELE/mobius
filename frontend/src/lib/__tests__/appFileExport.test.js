@@ -187,3 +187,33 @@ test('AppCanvas protocol routes only the live frame, reads only after confirmati
   assert.equal(replies.at(-1)[1].cancelled, true)
   assert.equal(pendingRef.current, null)
 })
+
+test('busy export can be cancelled without waiting for a stalled read', async () => {
+  const replies = []
+  const source = { postMessage: message => replies.push(message) }
+  const frames = new Map([[1, { contentWindow: source }]])
+  const pendingRef = { current: null }
+  const setPending = () => {}
+  const message = { type: 'moebius:file-export', requestId: 'slow', path: 'song.mp3' }
+  serveAppFileExportRequest({ message, source, frames, liveVersion: 1,
+    visible: true, pendingRef, setPending, appId: 12 })
+  let resolveRead
+  const saves = []
+  const confirmation = confirmAppFileExport({ pendingRef, setPending, appId: 12,
+    getVisible: () => true, getLiveVersion: () => 1,
+    getSourceVersion: value => attributedFrameVersion(frames, value),
+    getToken: () => 'scoped',
+    readFile: () => new Promise(resolve => { resolveRead = resolve }),
+    saveFile: (...args) => saves.push(args) })
+  const busy = pendingRef.current
+  assert.equal(busy.busy, true)
+  assert.equal(finishAppFileExport({ request: busy, pendingRef, setPending,
+    result: { cancelled: true } }), true)
+  assert.equal(busy.controller.signal.aborted, true)
+  assert.equal(pendingRef.current, null)
+  assert.deepEqual(replies, [{ type: 'moebius:file-export-result',
+    requestId: 'slow', cancelled: true }])
+  resolveRead(new Blob(['late']))
+  await confirmation
+  assert.deepEqual(saves, [])
+})

@@ -90,6 +90,19 @@ test('AppCanvas delegates export requests to the tested protocol before generic 
   assert.match(canvas, /retireStaleAppFileExport\(\{ pendingRef: pendingFileExportRef/)
 })
 
+test('export confirmation remains cancellable while busy and labels each dialog uniquely', () => {
+  const dialog = canvas.slice(canvas.indexOf('function AppFileExportDialog('),
+    canvas.indexOf('// ================================================================='))
+  assert.match(dialog, /const titleId = useId\(\)/)
+  assert.match(dialog, /aria-labelledby=\{titleId\}/)
+  assert.match(dialog, /<h2 id=\{titleId\}>/)
+  assert.match(dialog, /onClose: onCancel/)
+  assert.doesNotMatch(dialog, /shouldCloseOnEscape/)
+  assert.match(dialog, /ref=\{cancelRef\} onClick=\{onCancel\}>Cancel/)
+  assert.match(canvas, /function cancelFileExport\(\) \{\s*const request = pendingFileExportRef\.current\s*if \(request\) finishFileExport\(request, \{ cancelled: true \}\)/)
+  assert.match(canvas, /onCancel=\{cancelFileExport\}/)
+})
+
 test('frame bridge accepts results and changes only from its exact parent', async () => {
   const h = harness()
   const result = h.window.__mobiusStorageBridgeCall('get', ['note.json'])

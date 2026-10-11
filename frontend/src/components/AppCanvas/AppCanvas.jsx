@@ -1,5 +1,5 @@
 import {
-  forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useMemo,
+  forwardRef, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo,
   useReducer, useRef, useState,
 } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -69,28 +69,27 @@ function fileExportInk(color) {
 function AppFileExportDialog({ appName, themeColor, request, onCancel, onConfirm }) {
   const dialogRef = useRef(null)
   const cancelRef = useRef(null)
+  const titleId = useId()
   useDialogFocus({
-    containerRef: dialogRef, initialFocusRef: cancelRef,
-    onClose: onCancel, shouldCloseOnEscape: () => !request.busy,
+    containerRef: dialogRef, initialFocusRef: cancelRef, onClose: onCancel,
   })
   useEffect(() => {
     if (request.busy) dialogRef.current?.focus({ preventScroll: true })
   }, [request.busy])
   return (
     <div className="canvas-file-export" role="dialog" aria-modal="true"
-      aria-labelledby="canvas-file-export-title" ref={dialogRef} tabIndex={-1}>
+      aria-labelledby={titleId} ref={dialogRef} tabIndex={-1}>
       <div className="canvas-file-export__card" style={themeColor ? {
         '--file-export-accent': themeColor,
         '--file-export-ink': fileExportInk(themeColor),
       } : undefined}>
         <div className="canvas-file-export__eyebrow">FILE EXPORT</div>
-        <h2 id="canvas-file-export-title">Save a file from {appName || 'this app'}?</h2>
+        <h2 id={titleId}>Save a file from {appName || 'this app'}?</h2>
         <p className="canvas-file-export__name">{request.name}</p>
         <p>Only this app’s own file is accessible. Nothing downloads until you confirm.</p>
         {request.error && <p className="canvas-file-export__error" role="alert">{request.error}</p>}
         <div className="canvas-file-export__actions">
-          <button type="button" ref={cancelRef} onClick={onCancel}
-            disabled={request.busy}>Cancel</button>
+          <button type="button" ref={cancelRef} onClick={onCancel}>Cancel</button>
           <button type="button" className="canvas-file-export__primary"
             onClick={onConfirm} disabled={request.busy}>
             {request.busy ? 'Preparing…' : 'Save file'}
@@ -674,6 +673,10 @@ const AppCanvas = forwardRef(function AppCanvas({
   frameVisibleRef.current = frameVisible
   function finishFileExport(request, result) {
     finishAppFileExport({ request, pendingRef: pendingFileExportRef, setPending: setPendingFileExport, result })
+  }
+  function cancelFileExport() {
+    const request = pendingFileExportRef.current
+    if (request) finishFileExport(request, { cancelled: true })
   }
   function confirmFileExport() {
     return confirmAppFileExport({ pendingRef: pendingFileExportRef,
@@ -1855,7 +1858,7 @@ const AppCanvas = forwardRef(function AppCanvas({
       <CameraPreviewLayer preview={cameraPreview} />
       {pendingFileExport && visible && (
         <AppFileExportDialog appName={appName} themeColor={themeColor} request={pendingFileExport}
-          onCancel={() => finishFileExport(pendingFileExport, { cancelled: true })}
+          onCancel={cancelFileExport}
           onConfirm={confirmFileExport} />
       )}
       {/* One-shot "updated" shimmer on a successful swap. Keyed on the SWAP
