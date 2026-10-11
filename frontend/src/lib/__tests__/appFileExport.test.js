@@ -1,8 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  appFileExportUrl, MAX_APP_EXPORT_BYTES, parseAppFileExport, readAppFileExport,
+  appFileExportIsCurrent, appFileExportUrl, beginAppFileExport, finishAppFileExport,
+  MAX_APP_EXPORT_BYTES, parseAppFileExport, readAppFileExport,
 } from '../appFileExport.js'
+import { attributedFrameVersion } from '../../components/AppCanvas/appFrameProtocol.js'
 
 test('file export accepts only a bounded relative own-file path and safe name', () => {
   const message = { type: 'moebius:file-export', requestId: 'r1', path: 'library/files/abc.mp3', name: 'Artist / Track.mp3' }
@@ -72,4 +74,57 @@ test('file export does not begin fetching after cancellation', async () => {
     appId: 12, path: 'song.mp3', token: 'scoped', signal: controller.signal,
     fetchFile: () => { throw new Error('fetch must not run') },
   }), { name: 'AbortError' })
+})
+
+test('broker admits only the live visible frame before opening a confirmation', () => {
+  const replies = []
+  const live = { postMessage: message => replies.push(['live', message]) }
+  const buffered = { postMessage: message => replies.push(['buffered', message]) }
+  const frames = new Map([[1, { contentWindow: live }], [2, { contentWindow: buffered }]])
+  const message = { type: 'moebius:file-export', requestId: 'r1', path: 'library/song.mp3' }
+  const begin = (source, visible, pending = null) => beginAppFileExport({
+    message, source, visible, pending, appId: 12,
+    sourceVersion: attributedFrameVersion(frames, source), liveVersion: 1,
+  })
+  assert.equal(begin(buffered, true), null)
+  assert.equal(begin(live, false), null)
+  assert.equal(begin({ postMessage: message => replies.push(['stale', message]) }, true), null)
+  assert.deepEqual(replies.map(([, result]) => result.cancelled), [true, true, true])
+  const request = begin(live, true)
+  assert.equal(request.source, live)
+  assert.equal(request.frameVersion, 1)
+  assert.equal(replies.length, 3) // the accepted request only opens confirmation
+  assert.equal(begin(buffered, true, request), null)
+  assert.equal(begin(live, true, request), null)
+  assert.equal(replies[3][1].cancelled, true)
+  assert.match(replies[4][1].error, /current file export/)
+})
+
+test('broker retires a pending export when its frame is hidden or promoted away', () => {
+  const replies = []
+  const source = { postMessage: message => replies.push(message) }
+  const request = beginAppFileExport({
+    message: { type: 'moebius:file-export', requestId: 'r2', path: 'library/song.mp3' },
+    source, sourceVersion: 1, liveVersion: 1, visible: true, pending: null, appId: 12,
+  })
+  assert.equal(appFileExportIsCurrent({ request, appId: 12, visible: true,
+    liveVersion: 1, sourceVersion: 1 }), true)
+  assert.equal(appFileExportIsCurrent({ request, appId: 12, visible: false,
+    liveVersion: 1, sourceVersion: 1 }), false)
+  assert.equal(appFileExportIsCurrent({ request, appId: 12, visible: true,
+    liveVersion: 2, sourceVersion: 1 }), false)
+  assert.equal(appFileExportIsCurrent({ request, appId: 12, visible: true,
+    liveVersion: 1, sourceVersion: null }), false)
+  const controller = new AbortController()
+  const busy = { ...request, controller, busy: true }
+  const pendingRef = { current: busy }
+  const pendingStates = []
+  assert.equal(finishAppFileExport({ request: busy, pendingRef,
+    setPending: value => pendingStates.push(value), result: { cancelled: true } }), true)
+  assert.equal(controller.signal.aborted, true)
+  assert.equal(pendingRef.current, null)
+  assert.deepEqual(pendingStates, [null])
+  assert.deepEqual(replies, [{ type: 'moebius:file-export-result', requestId: 'r2', cancelled: true }])
+  assert.equal(finishAppFileExport({ request: busy, pendingRef,
+    setPending: () => { throw new Error('duplicate settlement') }, result: { ok: true } }), false)
 })

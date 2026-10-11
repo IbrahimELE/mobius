@@ -16,6 +16,46 @@ export function parseAppFileExport(message) {
   return { requestId, path, name }
 }
 
+function replyFileExport(source, requestId, result) {
+  if (typeof requestId !== 'string' || requestId.length > 160) return
+  try {
+    source.postMessage({ type: 'moebius:file-export-result', requestId, ...result }, '*')
+  } catch { /* the frame may have been retired */ }
+}
+
+// This is the prompt gate, not just an eventual read gate. Buffered frames
+// must never occupy the one confirmation slot or impersonate the live app.
+export function beginAppFileExport({ message, source, sourceVersion, liveVersion, visible, pending, appId }) {
+  if (!visible || sourceVersion == null || sourceVersion !== liveVersion) {
+    replyFileExport(source, message.requestId, { cancelled: true })
+    return null
+  }
+  const parsed = parseAppFileExport(message)
+  if (!parsed) {
+    replyFileExport(source, message.requestId, { error: 'Invalid file export request.' })
+    return null
+  }
+  if (pending) {
+    replyFileExport(source, parsed.requestId, { error: 'Finish the current file export first.' })
+    return null
+  }
+  return { ...parsed, source, frameVersion: sourceVersion, appId }
+}
+
+export function appFileExportIsCurrent({ request, visible, appId, liveVersion, sourceVersion }) {
+  return !!request && visible && request.appId === appId
+    && request.frameVersion === liveVersion && sourceVersion === liveVersion
+}
+
+export function finishAppFileExport({ request, pendingRef, setPending, result }) {
+  if (pendingRef.current !== request) return false
+  request.controller?.abort()
+  pendingRef.current = null
+  setPending(null)
+  replyFileExport(request.source, request.requestId, result)
+  return true
+}
+
 export function appFileExportUrl(appId, path) {
   return `/api/storage/apps/${encodeURIComponent(appId)}/${path.split('/').map(encodeURIComponent).join('/')}`
 }

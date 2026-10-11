@@ -47,7 +47,8 @@ import {
 import { useManagedAppFrameForwarding } from '../../hooks/useManagedAppEvents.js'
 import { writeClipboardText } from '../../runtime/clipboard.js'
 import {
-  parseAppFileExport, readAppFileExport, saveAppFileExport,
+  appFileExportIsCurrent, beginAppFileExport, finishAppFileExport,
+  readAppFileExport, saveAppFileExport,
 } from '../../lib/appFileExport.js'
 import {
   initSwapState, reduceSwap, compareVersions, INCOMING_SWAP_TIMEOUT_MS,
@@ -627,11 +628,16 @@ const AppCanvas = forwardRef(function AppCanvas({
           // AppCanvas can temporarily render a service/loading surface without
           // unmounting itself. Ref removal is the exhaustive boundary for the
           // exact live document, including those non-component teardown paths.
+          const detachedSource = framesRef.current.get(v)?.contentWindow
+          const pendingExport = pendingFileExportRef.current
+          if (pendingExport?.source === detachedSource) {
+            finishFileExport(pendingExport, { cancelled: true })
+          }
           capabilityHostRef.current?.detachSource?.(
-            framesRef.current.get(v)?.contentWindow,
+            detachedSource,
           )
-          storageHostRef.current.detachSource(framesRef.current.get(v)?.contentWindow)
-          if (accountLinkRef.current?.source === framesRef.current.get(v)?.contentWindow) {
+          storageHostRef.current.detachSource(detachedSource)
+          if (accountLinkRef.current?.source === detachedSource) {
             clearAccountLinkRegistration()
           }
           retireFrameMediaSession(v)
@@ -667,23 +673,14 @@ const AppCanvas = forwardRef(function AppCanvas({
   const frameVisibleRef = useRef(frameVisible)
   frameVisibleRef.current = frameVisible
   function finishFileExport(request, result) {
-    if (pendingFileExportRef.current !== request) return
-    request.controller?.abort()
-    pendingFileExportRef.current = null
-    setPendingFileExport(null)
-    try {
-      request.source.postMessage({
-        type: 'moebius:file-export-result', requestId: request.requestId,
-        ...result,
-      }, '*')
-    } catch { /* frame retired while confirmation was open */ }
+    finishAppFileExport({ request, pendingRef: pendingFileExportRef, setPending: setPendingFileExport, result })
   }
   async function confirmFileExport() {
     const request = pendingFileExportRef.current
     if (!request || request.busy) return
-    if (!visibleRef.current || request.appId !== appId
-        || attributedFrameVersion(framesRef.current, request.source)
-        !== liveVersionRef.current || request.frameVersion !== liveVersionRef.current) {
+    if (!appFileExportIsCurrent({ request, appId, visible: visibleRef.current,
+      liveVersion: liveVersionRef.current,
+      sourceVersion: attributedFrameVersion(framesRef.current, request.source) })) {
       finishFileExport(request, { cancelled: true })
       return
     }
@@ -695,9 +692,9 @@ const AppCanvas = forwardRef(function AppCanvas({
         appId, path: request.path, token: hostTokenRef.current, signal: busy.controller.signal,
       })
       if (pendingFileExportRef.current !== busy) return
-      if (!visibleRef.current || request.appId !== appId
-          || attributedFrameVersion(framesRef.current, request.source)
-          !== liveVersionRef.current || request.frameVersion !== liveVersionRef.current) {
+      if (!appFileExportIsCurrent({ request, appId, visible: visibleRef.current,
+        liveVersion: liveVersionRef.current,
+        sourceVersion: attributedFrameVersion(framesRef.current, request.source) })) {
         finishFileExport(busy, { cancelled: true })
         return
       }
@@ -1042,6 +1039,17 @@ const AppCanvas = forwardRef(function AppCanvas({
         return
       }
 
+      if (msg.type === 'moebius:file-export') {
+        const request = beginAppFileExport({ message: msg, source: e.source,
+          sourceVersion: srcVersion, liveVersion: liveVersionRef.current,
+          visible: visibleRef.current, pending: pendingFileExportRef.current, appId })
+        if (request) {
+          pendingFileExportRef.current = request
+          setPendingFileExport(request)
+        }
+        return
+      }
+
       // Everything below is a concern of the VISIBLE frame only. Ignore it from
       // a hidden incoming frame: it isn't interactive and shouldn't emit these,
       // but a mount-time nav-push must never install a shell history sentinel for
@@ -1057,39 +1065,6 @@ const AppCanvas = forwardRef(function AppCanvas({
           source: e.source,
           writeText: writeClipboardText,
         })
-        return
-      }
-
-      if (msg.type === 'moebius:file-export') {
-        if (!visibleRef.current) {
-          if (typeof msg.requestId === 'string' && msg.requestId.length <= 160) {
-            try { e.source.postMessage({
-              type: 'moebius:file-export-result', requestId: msg.requestId,
-              cancelled: true,
-            }, '*') } catch {}
-          }
-          return
-        }
-        const parsed = parseAppFileExport(msg)
-        if (!parsed) {
-          if (typeof msg.requestId === 'string' && msg.requestId.length <= 160) {
-            try { e.source.postMessage({
-              type: 'moebius:file-export-result', requestId: msg.requestId,
-              error: 'Invalid file export request.',
-            }, '*') } catch {}
-          }
-          return
-        }
-        if (pendingFileExportRef.current) {
-          try { e.source.postMessage({
-            type: 'moebius:file-export-result', requestId: parsed.requestId,
-            error: 'Finish the current file export first.',
-          }, '*') } catch {}
-          return
-        }
-        const request = { ...parsed, source: e.source, frameVersion: srcVersion, appId }
-        pendingFileExportRef.current = request
-        setPendingFileExport(request)
         return
       }
 
@@ -1335,8 +1310,9 @@ const AppCanvas = forwardRef(function AppCanvas({
   // a new version cannot leave a stale prompt able to export the old file.
   useLayoutEffect(() => {
     const request = pendingFileExportRef.current
-    if (request && (!visible || request.appId !== appId
-        || request.frameVersion !== swap.liveVersion)) {
+    if (request && !appFileExportIsCurrent({ request, appId, visible,
+      liveVersion: swap.liveVersion,
+      sourceVersion: attributedFrameVersion(framesRef.current, request.source) })) {
       finishFileExport(request, { cancelled: true })
     }
   }, [appId, visible, swap.liveVersion])
