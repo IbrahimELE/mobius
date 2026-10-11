@@ -668,6 +668,7 @@ const AppCanvas = forwardRef(function AppCanvas({
   frameVisibleRef.current = frameVisible
   function finishFileExport(request, result) {
     if (pendingFileExportRef.current !== request) return
+    request.controller?.abort()
     pendingFileExportRef.current = null
     setPendingFileExport(null)
     try {
@@ -686,12 +687,12 @@ const AppCanvas = forwardRef(function AppCanvas({
       finishFileExport(request, { cancelled: true })
       return
     }
-    const busy = { ...request, busy: true, error: null }
+    const busy = { ...request, busy: true, error: null, controller: new AbortController() }
     pendingFileExportRef.current = busy
     setPendingFileExport(busy)
     try {
       const blob = await readAppFileExport({
-        appId, path: request.path, token: hostTokenRef.current,
+        appId, path: request.path, token: hostTokenRef.current, signal: busy.controller.signal,
       })
       if (pendingFileExportRef.current !== busy) return
       if (!visibleRef.current || request.appId !== appId

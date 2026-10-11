@@ -11,7 +11,7 @@ export function parseAppFileExport(message) {
   const parts = path.split('/')
   if (parts.some(part => !part || part === '.' || part === '..' || /[\\\u0000-\u001f\u007f]/.test(part))) return null
   const suggested = typeof message.name === 'string' ? message.name : parts.at(-1)
-  const name = suggested.replace(/[\\/<>:"|?*\u0000-\u001f\u007f]/g, '_').trim().slice(0, 180)
+  const name = suggested.replace(/[\\/<>:"|?*\u0000-\u001f\u007f\u061c\u200e\u200f\u202a-\u202e\u2066-\u206f]/g, '_').trim().slice(0, 180)
   if (!name) return null
   return { requestId, path, name }
 }
@@ -20,11 +20,13 @@ export function appFileExportUrl(appId, path) {
   return `/api/storage/apps/${encodeURIComponent(appId)}/${path.split('/').map(encodeURIComponent).join('/')}`
 }
 
-export async function readAppFileExport({ appId, path, token, fetchFile = fetch }) {
+export async function readAppFileExport({ appId, path, token, signal, fetchFile = fetch }) {
   if (!token) throw new Error('App session is unavailable.')
+  if (signal?.aborted) throw new DOMException('File export cancelled.', 'AbortError')
   const response = await fetchFile(appFileExportUrl(appId, path), {
-    headers: { Authorization: `Bearer ${token}` }, cache: 'no-store',
+    headers: { Authorization: `Bearer ${token}` }, cache: 'no-store', signal,
   })
+  if (signal?.aborted) throw new DOMException('File export cancelled.', 'AbortError')
   if (!response.ok) throw new Error(`File could not be read (${response.status}).`)
   const declared = Number(response.headers.get('content-length'))
   if (Number.isFinite(declared) && declared > MAX_APP_EXPORT_BYTES) {
@@ -33,11 +35,14 @@ export async function readAppFileExport({ appId, path, token, fetchFile = fetch 
   }
   if (!response.body) throw new Error('File streaming is unavailable.')
   const reader = response.body.getReader()
+  const abortRead = () => { void reader.cancel().catch(() => {}) }
+  signal?.addEventListener('abort', abortRead, { once: true })
   const chunks = []
   let size = 0
   try {
     while (true) {
       const { done, value } = await reader.read()
+      if (signal?.aborted) throw new DOMException('File export cancelled.', 'AbortError')
       if (done) break
       size += value.byteLength
       if (size > MAX_APP_EXPORT_BYTES) {
@@ -46,7 +51,10 @@ export async function readAppFileExport({ appId, path, token, fetchFile = fetch 
       }
       chunks.push(value)
     }
-  } finally { reader.releaseLock() }
+  } finally {
+    signal?.removeEventListener('abort', abortRead)
+    reader.releaseLock()
+  }
   return new Blob(chunks, { type: response.headers.get('content-type') || 'application/octet-stream' })
 }
 
