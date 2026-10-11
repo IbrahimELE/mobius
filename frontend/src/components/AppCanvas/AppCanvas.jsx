@@ -40,16 +40,16 @@ import {
   applyVirtualStorageMutation,
   attributedFrameVersion,
   attributedShellShortcutAction,
+  confirmAppFileExport,
+  retireStaleAppFileExport,
+  serveAppFileExportRequest,
   serveClipboardWrite,
   serveModuleRequest,
   serveStorageRpc,
 } from './appFrameProtocol.js'
 import { useManagedAppFrameForwarding } from '../../hooks/useManagedAppEvents.js'
 import { writeClipboardText } from '../../runtime/clipboard.js'
-import {
-  appFileExportIsCurrent, beginAppFileExport, finishAppFileExport,
-  readAppFileExport, saveAppFileExport,
-} from '../../lib/appFileExport.js'
+import { finishAppFileExport } from '../../lib/appFileExport.js'
 import {
   initSwapState, reduceSwap, compareVersions, INCOMING_SWAP_TIMEOUT_MS,
 } from '../../lib/previewSwapState.js'
@@ -675,37 +675,13 @@ const AppCanvas = forwardRef(function AppCanvas({
   function finishFileExport(request, result) {
     finishAppFileExport({ request, pendingRef: pendingFileExportRef, setPending: setPendingFileExport, result })
   }
-  async function confirmFileExport() {
-    const request = pendingFileExportRef.current
-    if (!request || request.busy) return
-    if (!appFileExportIsCurrent({ request, appId, visible: visibleRef.current,
-      liveVersion: liveVersionRef.current,
-      sourceVersion: attributedFrameVersion(framesRef.current, request.source) })) {
-      finishFileExport(request, { cancelled: true })
-      return
-    }
-    const busy = { ...request, busy: true, error: null, controller: new AbortController() }
-    pendingFileExportRef.current = busy
-    setPendingFileExport(busy)
-    try {
-      const blob = await readAppFileExport({
-        appId, path: request.path, token: hostTokenRef.current, signal: busy.controller.signal,
-      })
-      if (pendingFileExportRef.current !== busy) return
-      if (!appFileExportIsCurrent({ request, appId, visible: visibleRef.current,
-        liveVersion: liveVersionRef.current,
-        sourceVersion: attributedFrameVersion(framesRef.current, request.source) })) {
-        finishFileExport(busy, { cancelled: true })
-        return
-      }
-      saveAppFileExport(blob, request.name)
-      finishFileExport(busy, { ok: true })
-    } catch (error) {
-      if (pendingFileExportRef.current !== busy) return
-      const failed = { ...request, error: error?.message || 'File export failed.' }
-      pendingFileExportRef.current = failed
-      setPendingFileExport(failed)
-    }
+  function confirmFileExport() {
+    return confirmAppFileExport({ pendingRef: pendingFileExportRef,
+      setPending: setPendingFileExport, appId,
+      getVisible: () => visibleRef.current,
+      getLiveVersion: () => liveVersionRef.current,
+      getSourceVersion: source => attributedFrameVersion(framesRef.current, source),
+      getToken: () => hostTokenRef.current })
   }
   const capabilityContractRef = useRef(capabilityContract)
   capabilityContractRef.current = capabilityContract
@@ -921,6 +897,10 @@ const AppCanvas = forwardRef(function AppCanvas({
       if (e.origin !== 'null' && e.origin !== window.location.origin) return
       const msg = e.data
       if (!msg || typeof msg !== 'object') return
+      if (serveAppFileExportRequest({ message: msg, source: e.source,
+        frames: framesRef.current, liveVersion: liveVersionRef.current,
+        visible: visibleRef.current, pendingRef: pendingFileExportRef,
+        setPending: setPendingFileExport, appId })) return
       // ATTRIBUTE the message to the exact frame that sent it. Two frames are
       // alive during a swap, so we must NOT assume a single contentWindow —
       // compare e.source to each mounted frame's window and recover its version.
@@ -1035,17 +1015,6 @@ const AppCanvas = forwardRef(function AppCanvas({
           delete nav.location
         } else {
           nav.location = location
-        }
-        return
-      }
-
-      if (msg.type === 'moebius:file-export') {
-        const request = beginAppFileExport({ message: msg, source: e.source,
-          sourceVersion: srcVersion, liveVersion: liveVersionRef.current,
-          visible: visibleRef.current, pending: pendingFileExportRef.current, appId })
-        if (request) {
-          pendingFileExportRef.current = request
-          setPendingFileExport(request)
         }
         return
       }
@@ -1309,12 +1278,9 @@ const AppCanvas = forwardRef(function AppCanvas({
   // A confirmation belongs to one visible frame. Switching away or promoting
   // a new version cannot leave a stale prompt able to export the old file.
   useLayoutEffect(() => {
-    const request = pendingFileExportRef.current
-    if (request && !appFileExportIsCurrent({ request, appId, visible,
-      liveVersion: swap.liveVersion,
-      sourceVersion: attributedFrameVersion(framesRef.current, request.source) })) {
-      finishFileExport(request, { cancelled: true })
-    }
+    retireStaleAppFileExport({ pendingRef: pendingFileExportRef,
+      setPending: setPendingFileExport, appId, visible,
+      liveVersion: swap.liveVersion, frames: framesRef.current })
   }, [appId, visible, swap.liveVersion])
   useEffect(() => () => {
     const request = pendingFileExportRef.current

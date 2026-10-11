@@ -4,7 +4,10 @@ import {
   appFileExportIsCurrent, appFileExportUrl, beginAppFileExport, finishAppFileExport,
   MAX_APP_EXPORT_BYTES, parseAppFileExport, readAppFileExport,
 } from '../appFileExport.js'
-import { attributedFrameVersion } from '../../components/AppCanvas/appFrameProtocol.js'
+import {
+  attributedFrameVersion, confirmAppFileExport, retireStaleAppFileExport,
+  serveAppFileExportRequest,
+} from '../../components/AppCanvas/appFrameProtocol.js'
 
 test('file export accepts only a bounded relative own-file path and safe name', () => {
   const message = { type: 'moebius:file-export', requestId: 'r1', path: 'library/files/abc.mp3', name: 'Artist / Track.mp3' }
@@ -127,4 +130,60 @@ test('broker retires a pending export when its frame is hidden or promoted away'
   assert.deepEqual(replies, [{ type: 'moebius:file-export-result', requestId: 'r2', cancelled: true }])
   assert.equal(finishAppFileExport({ request: busy, pendingRef,
     setPending: () => { throw new Error('duplicate settlement') }, result: { ok: true } }), false)
+})
+
+test('AppCanvas protocol routes only the live frame, reads only after confirmation, and cancels on hide', async () => {
+  const replies = []
+  const live = { postMessage: message => replies.push(['live', message]) }
+  const buffered = { postMessage: message => replies.push(['buffered', message]) }
+  const frames = new Map([[1, { contentWindow: live }], [2, { contentWindow: buffered }]])
+  const pendingRef = { current: null }
+  const prompts = []
+  const setPending = value => prompts.push(value)
+  const message = { type: 'moebius:file-export', requestId: 'r3', path: 'library/song.mp3' }
+  const serve = (source, visible = true) => serveAppFileExportRequest({
+    message, source, frames, liveVersion: 1, visible,
+    pendingRef, setPending, appId: 12,
+  })
+  assert.equal(serve(buffered), true)
+  assert.equal(pendingRef.current, null)
+  assert.equal(prompts.length, 0)
+  assert.equal(replies[0][1].cancelled, true)
+  assert.equal(serve({ postMessage: () => { throw new Error('unknown frame replied') } }), true)
+  assert.equal(prompts.length, 0)
+  assert.equal(serve(live), true)
+  assert.equal(prompts.length, 1)
+  let reads = 0
+  const saves = []
+  const confirm = readFile => confirmAppFileExport({ pendingRef, setPending, appId: 12,
+    getVisible: () => true, getLiveVersion: () => 1,
+    getSourceVersion: source => attributedFrameVersion(frames, source),
+    getToken: () => 'scoped', readFile, saveFile: (...args) => saves.push(args) })
+  assert.equal(reads, 0) // request handling only opened the confirmation
+  await confirm(async ({ appId, path, token }) => {
+    reads += 1
+    assert.deepEqual([appId, path, token], [12, 'library/song.mp3', 'scoped'])
+    return new Blob(['audio'])
+  })
+  assert.equal(reads, 1)
+  assert.equal(saves.length, 1)
+  assert.equal(replies.at(-1)[1].ok, true)
+  assert.equal(pendingRef.current, null)
+
+  assert.equal(serve(live), true)
+  let resolveRead
+  const reading = confirm(({ signal }) => {
+    assert.equal(signal.aborted, false)
+    return new Promise(resolve => { resolveRead = resolve })
+  })
+  assert.equal(prompts.at(-1).busy, true)
+  const activeSignal = prompts.at(-1).controller.signal
+  assert.equal(retireStaleAppFileExport({ pendingRef, setPending, appId: 12,
+    visible: false, liveVersion: 1, frames }), true)
+  assert.equal(activeSignal.aborted, true)
+  resolveRead(new Blob(['late']))
+  await reading
+  assert.equal(saves.length, 1) // a retired frame cannot download late data
+  assert.equal(replies.at(-1)[1].cancelled, true)
+  assert.equal(pendingRef.current, null)
 })
